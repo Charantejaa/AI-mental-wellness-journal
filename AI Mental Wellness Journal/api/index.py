@@ -9,4 +9,3 @@ from app import app
 # Export the Flask app for Vercel
 # Vercel will use this as the WSGI application
 application = app
-
