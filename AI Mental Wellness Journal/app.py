@@ -40,45 +40,47 @@ if MODE == 'cloud' and SUPABASE_URL and SUPABASE_KEY:
 else:
     print(f"[WARN] Cloud mode requirements not met. MODE={MODE}, Has URL={bool(SUPABASE_URL)}, Has KEY={bool(SUPABASE_KEY)}")
 
-if MODE == 'local':
-    print("[OK] Using SQLite (Local Mode)")
-    DATABASE = 'journal.db'
-    
-    def get_db():
-        """Get database connection"""
-        db = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-        return db
-    
-    def init_db():
-        """Initialize the database"""
-        db = get_db()
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS journal_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                sentiment_score REAL NOT NULL,
-                emotions TEXT DEFAULT '[]',
-                key_themes TEXT DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        db.commit()
-        db.close()
-    
-    # Initialize database
-    init_db()
+# Always initialize SQLite as fallback
+print("[OK] Initializing SQLite (Local Mode/Fallback)")
+DATABASE = 'journal.db'
+
+def get_db():
+    """Get database connection"""
+    # Ensure database file exists and is writable
+    db_path = os.path.abspath(DATABASE)
+    db = sqlite3.connect(db_path, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    return db
+
+def init_db():
+    """Initialize the database"""
+    db = get_db()
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            sentiment_score REAL NOT NULL,
+            emotions TEXT DEFAULT '[]',
+            key_themes TEXT DEFAULT '[]',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    db.commit()
+    db.close()
+
+# Initialize database
+init_db()
 
 # Initialize OpenAI if API key is available
 if OPENAI_API_KEY and OPENAI_API_KEY.startswith('sk-'):
@@ -115,23 +117,32 @@ def login():
         
         try:
             if MODE == 'cloud' and supabase:
-                # Authenticate with Supabase
-                auth_response = supabase.auth.sign_in_with_password({
-                    "email": email,
-                    "password": password
-                })
-                
-                if auth_response.user:
-                    session['access_token'] = auth_response.session.access_token
-                    session['user'] = {
-                        'id': auth_response.user.id,
-                        'email': auth_response.user.email
-                    }
-                    return jsonify({'success': True, 'redirect': url_for('dashboard')})
-                else:
-                    return jsonify({'success': False, 'error': 'Invalid email or password'}), 400
-            else:
-                # Local SQLite authentication
+                # Try Supabase authentication first
+                try:
+                    auth_response = supabase.auth.sign_in_with_password({
+                        "email": email,
+                        "password": password
+                    })
+                    
+                    if auth_response.user:
+                        session['access_token'] = auth_response.session.access_token
+                        session['user'] = {
+                            'id': auth_response.user.id,
+                            'email': auth_response.user.email
+                        }
+                        return jsonify({'success': True, 'redirect': url_for('dashboard')})
+                    else:
+                        # If Supabase auth fails, try local SQLite
+                        print("[DEBUG] Supabase auth failed, trying local SQLite")
+                        raise Exception("Supabase auth failed")
+                        
+                except Exception as supabase_error:
+                    # Fall back to local SQLite authentication
+                    print(f"[DEBUG] Supabase login failed: {supabase_error}, trying SQLite fallback")
+                    pass  # Continue to SQLite check below
+            
+            # Local SQLite authentication (or fallback from Supabase)
+            if MODE == 'local' or supabase:  # Always try SQLite as fallback
                 db = get_db()
                 user = db.execute('SELECT * FROM users WHERE email = ? AND password = ?', 
                                 (email, password)).fetchone()
@@ -143,10 +154,13 @@ def login():
                         'email': user['email']
                     }
                     return jsonify({'success': True, 'redirect': url_for('dashboard')})
-                else:
-                    return jsonify({'success': False, 'error': 'Invalid email or password'}), 400
+            
+            # If we get here, authentication failed
+            return jsonify({'success': False, 'error': 'Invalid email or password'}), 400
+            
         except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 400
+            print(f"[ERROR] Login error: {e}")
+            return jsonify({'success': False, 'error': 'Invalid email or password'}), 400
     
     return render_template('login.html')
 
@@ -157,36 +171,94 @@ def signup():
         email = data.get('email')
         password = data.get('password')
         
+        use_fallback = False
         try:
             if MODE == 'cloud' and supabase:
                 # Create user with Supabase Auth
-                auth_response = supabase.auth.sign_up({
-                    "email": email,
-                    "password": password
-                })
-                
-                if auth_response.user:
-                    return jsonify({'success': True, 'message': 'Account created! Please log in.'})
-                else:
-                    return jsonify({'success': False, 'error': 'Failed to create account'}), 400
-            elif MODE == 'local':
-                # Local SQLite user creation
-                db = get_db()
+                print(f"[DEBUG] Attempting Supabase signup for: {email}")
                 try:
-                    db.execute('INSERT INTO users (email, password) VALUES (?, ?)', 
+                    auth_response = supabase.auth.sign_up({
+                        "email": email,
+                        "password": password
+                    })
+                    
+                    print(f"[DEBUG] Supabase response: {auth_response}")
+                    
+                    if auth_response.user:
+                        # Check if email confirmation is required
+                        if hasattr(auth_response, 'session') and auth_response.session is None:
+                            return jsonify({
+                                'success': True, 
+                                'message': 'Account created! Please check your email to confirm your account before logging in.'
+                            })
+                        return jsonify({'success': True, 'message': 'Account created! Please log in.'})
+                    else:
+                        print(f"[ERROR] Supabase signup failed - no user returned")
+                        return jsonify({'success': False, 'error': 'Failed to create account'}), 400
+                        
+                except Exception as supabase_error:
+                    error_msg = str(supabase_error).lower()
+                    # If rate limited, fall back to local SQLite
+                    if 'rate limit' in error_msg or 'too many' in error_msg:
+                        print(f"[WARN] Supabase rate limited, falling back to SQLite for this request")
+                        use_fallback = True
+                    else:
+                        raise  # Re-raise if it's not a rate limit error
+            
+            # Local SQLite user creation (or fallback from Supabase rate limit)
+            if MODE == 'local' or use_fallback:
+                db = None
+                try:
+                    db = get_db()
+                    cursor = db.cursor()
+                    cursor.execute('INSERT INTO users (email, password) VALUES (?, ?)', 
                               (email, password))
                     db.commit()
-                    db.close()
+                    
+                    # If this was a fallback from Supabase, inform the user
+                    if use_fallback:
+                        return jsonify({
+                            'success': True, 
+                            'message': 'Account created locally! (Supabase temporarily unavailable)'
+                        })
                     return jsonify({'success': True, 'message': 'Account created! Please log in.'})
                 except sqlite3.IntegrityError:
+                    if db:
+                        db.rollback()
                     return jsonify({'success': False, 'error': 'Email already exists'}), 400
+                except sqlite3.OperationalError as e:
+                    if db:
+                        db.rollback()
+                    print(f"[ERROR] Database operational error: {e}")
+                    return jsonify({'success': False, 'error': 'Database error. Please check file permissions.'}), 500
+                finally:
+                    if db:
+                        db.close()
             else:
                 return jsonify({'success': False, 'error': 'Database not configured'}), 500
         except Exception as e:
             error_message = str(e)
             print(f"[ERROR] Signup failed: {error_message}")
-            if 'already registered' in error_message.lower():
+            print(f"[ERROR] Full exception: {repr(e)}")
+            
+            # Handle specific Supabase errors
+            if 'rate limit' in error_message.lower() or 'too many requests' in error_message.lower():
+                return jsonify({
+                    'success': False, 
+                    'error': 'Too many signup attempts. Please try again in a few minutes.'
+                }), 429
+            elif 'already registered' in error_message.lower() or 'already exists' in error_message.lower():
                 return jsonify({'success': False, 'error': 'Email already exists'}), 400
+            elif 'invalid email' in error_message.lower():
+                return jsonify({'success': False, 'error': 'Invalid email address'}), 400
+            elif 'password' in error_message.lower() and 'short' in error_message.lower():
+                return jsonify({'success': False, 'error': 'Password must be at least 6 characters'}), 400
+            elif 'email' in error_message.lower() and 'confirm' in error_message.lower():
+                return jsonify({
+                    'success': False, 
+                    'error': 'Please check your email to confirm your account'
+                }), 400
+            
             return jsonify({'success': False, 'error': error_message}), 400
     
     return render_template('signup.html')
